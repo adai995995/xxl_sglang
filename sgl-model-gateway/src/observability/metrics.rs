@@ -909,6 +909,17 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Record cache-aware policy execution branch for routing decisions.
+    ///
+    /// Used by cache_aware policy to track preferred-worker overrides and fallback paths.
+    pub fn record_worker_cache_aware_policy_branch(branch: &'static str) {
+        counter!(
+            "smg_cache_aware_policy_branch_total",
+            "branch" => branch
+        )
+        .increment(1);
+    }
+
     /// Set running requests per worker
     pub fn set_worker_requests_active(worker: &str, count: usize) {
         let worker_interned = intern_string(worker);

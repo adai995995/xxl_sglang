@@ -72,6 +72,8 @@ use super::{
     CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo,
 };
 use crate::core::{Worker, UNKNOWN_MODEL_ID};
+use crate::observability::metrics::Metrics;
+use crate::routers::header_utils::extract_preferred_worker_url;
 
 /// Cache-aware routing policy
 ///
@@ -353,6 +355,41 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
     ) -> Option<usize> {
+        // Preferred worker override (ROLL resume affinity).
+        //
+        // If the caller provides a preferred worker URL, route to it if it exists
+        // in the filtered worker list and is healthy; otherwise fall back to
+        // cache-aware selection.
+        if let Some(preferred_url) = extract_preferred_worker_url(info.headers) {
+            if let Some(idx) = workers
+                .iter()
+                .position(|w| w.url() == preferred_url && w.is_healthy())
+            {
+                // Keep cache tree state consistent (best-effort).
+                let model_id = normalize_model_key(workers[idx].model_id());
+                if let Some(text) = info.request_text {
+                    let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+                    if let Some(tree) = tree {
+                        tree.insert(text, workers[idx].url());
+                    }
+                }
+
+                workers[idx].increment_processed();
+                Metrics::record_worker_cache_aware_policy_branch("preferred_hit");
+                return Some(idx);
+            }
+
+            // Preferred worker not found or unhealthy. Fall back to normal routing.
+            let branch = if workers.iter().any(|w| w.url() == preferred_url) {
+                "preferred_miss_unhealthy"
+            } else {
+                "preferred_miss_not_found"
+            };
+            Metrics::record_worker_cache_aware_policy_branch(branch);
+        } else {
+            Metrics::record_worker_cache_aware_policy_branch("preferred_miss_empty");
+        }
+
         let request_text = info.request_text;
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -511,6 +548,7 @@ impl Default for CacheAwarePolicy {
 mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
+    use http::HeaderMap;
 
     #[tokio::test]
     async fn test_cache_aware_with_balanced_load() {
@@ -883,5 +921,120 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(idx, 0);
+    }
+
+    #[tokio::test]
+    async fn test_cache_aware_preferred_worker_url_hit() {
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+        ];
+        policy.init_workers(&workers);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-roll-preferred-worker-url", "http://w2:8000".parse().unwrap());
+
+        let idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("hello world"),
+                    headers: Some(&headers),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(idx, 1);
+    }
+
+    #[tokio::test]
+    async fn test_cache_aware_preferred_worker_url_not_found_fallback() {
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+        ];
+        policy.init_workers(&workers);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-roll-preferred-worker-url", "http://w3:8000".parse().unwrap());
+
+        let idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("hello world"),
+                    headers: Some(&headers),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(idx < workers.len());
+    }
+
+    #[tokio::test]
+    async fn test_cache_aware_preferred_worker_url_unhealthy_fallback() {
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+        ];
+        policy.init_workers(&workers);
+        workers[1].set_healthy(false);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-roll-preferred-worker-url", "http://w2:8000".parse().unwrap());
+
+        let idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("hello world"),
+                    headers: Some(&headers),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_ne!(idx, 1);
     }
 }

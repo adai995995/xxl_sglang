@@ -7,6 +7,10 @@ use http::header::HeaderName;
 
 static HEADER_TARGET_WORKER: HeaderName = HeaderName::from_static("x-smg-target-worker");
 static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
+static HEADER_ROLL_PREFERRED_WORKER_URL: HeaderName =
+    HeaderName::from_static("x-roll-preferred-worker-url");
+static HEADER_SMG_PREFERRED_WORKER_URL: HeaderName =
+    HeaderName::from_static("x-smg-preferred-worker-url");
 
 fn extract_header_value<'a>(headers: Option<&'a HeaderMap>, name: &HeaderName) -> Option<&'a str> {
     headers
@@ -21,6 +25,16 @@ pub fn extract_target_worker(headers: Option<&HeaderMap>) -> Option<&str> {
 
 pub fn extract_routing_key(headers: Option<&HeaderMap>) -> Option<&str> {
     extract_header_value(headers, &HEADER_ROUTING_KEY)
+}
+
+/// Extract preferred worker URL for resume-affinity routing.
+///
+/// Priority:
+/// 1) `X-ROLL-Preferred-Worker-Url` (primary integration header)
+/// 2) `X-SMG-Preferred-Worker-Url` (gateway-native alias)
+pub fn extract_preferred_worker_url(headers: Option<&HeaderMap>) -> Option<&str> {
+    extract_header_value(headers, &HEADER_ROLL_PREFERRED_WORKER_URL)
+        .or_else(|| extract_header_value(headers, &HEADER_SMG_PREFERRED_WORKER_URL))
 }
 
 /// Copy request headers to a Vec of name-value string pairs
