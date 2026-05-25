@@ -11,6 +11,13 @@ static HEADER_ROLL_PREFERRED_WORKER_URL: HeaderName =
     HeaderName::from_static("x-roll-preferred-worker-url");
 static HEADER_SMG_PREFERRED_WORKER_URL: HeaderName =
     HeaderName::from_static("x-smg-preferred-worker-url");
+static HEADER_SMG_SELECTED_WORKER_URL: HeaderName =
+    HeaderName::from_static("x-smg-selected-worker-url");
+static HEADER_SMG_SELECTED_WORKER_ID: HeaderName =
+    HeaderName::from_static("x-smg-selected-worker-id");
+static HEADER_ROLL_PAUSE_AGE_S: HeaderName = HeaderName::from_static("x-roll-pause-age-s");
+static HEADER_ROLL_HISTORY_LEN_TOKENS: HeaderName =
+    HeaderName::from_static("x-roll-history-len-tokens");
 
 fn extract_header_value<'a>(headers: Option<&'a HeaderMap>, name: &HeaderName) -> Option<&'a str> {
     headers
@@ -35,6 +42,24 @@ pub fn extract_routing_key(headers: Option<&HeaderMap>) -> Option<&str> {
 pub fn extract_preferred_worker_url(headers: Option<&HeaderMap>) -> Option<&str> {
     extract_header_value(headers, &HEADER_ROLL_PREFERRED_WORKER_URL)
         .or_else(|| extract_header_value(headers, &HEADER_SMG_PREFERRED_WORKER_URL))
+}
+
+pub fn extract_roll_pause_age_s(headers: Option<&HeaderMap>) -> Option<f64> {
+    extract_header_value(headers, &HEADER_ROLL_PAUSE_AGE_S).and_then(|v| v.parse::<f64>().ok())
+}
+
+pub fn extract_roll_history_len_tokens(headers: Option<&HeaderMap>) -> Option<usize> {
+    extract_header_value(headers, &HEADER_ROLL_HISTORY_LEN_TOKENS)
+        .and_then(|v| v.parse::<usize>().ok())
+}
+
+pub fn insert_selected_worker_headers(headers: &mut HeaderMap, worker_url: &str, worker_id: &str) {
+    if let Ok(value) = HeaderValue::from_str(worker_url) {
+        headers.insert(HEADER_SMG_SELECTED_WORKER_URL.clone(), value);
+    }
+    if let Ok(value) = HeaderValue::from_str(worker_id) {
+        headers.insert(HEADER_SMG_SELECTED_WORKER_ID.clone(), value);
+    }
 }
 
 /// Copy request headers to a Vec of name-value string pairs

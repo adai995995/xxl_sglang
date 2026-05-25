@@ -316,6 +316,13 @@ impl Router {
                 load_guard,
             )
             .await;
+        let mut response = response;
+        let worker_id = self.worker_registry.reserve_id_for_url(worker.url());
+        header_utils::insert_selected_worker_headers(
+            response.headers_mut(),
+            worker.url(),
+            worker_id.as_str(),
+        );
 
         events::RequestReceivedEvent {}.emit();
 

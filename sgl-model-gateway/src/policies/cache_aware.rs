@@ -59,7 +59,7 @@
     during the next eviction cycle.
 */
 
-use std::sync::Arc;
+use std::{env, sync::Arc};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -73,7 +73,9 @@ use super::{
 };
 use crate::core::{Worker, UNKNOWN_MODEL_ID};
 use crate::observability::metrics::Metrics;
-use crate::routers::header_utils::extract_preferred_worker_url;
+use crate::routers::header_utils::{
+    extract_preferred_worker_url, extract_roll_history_len_tokens, extract_roll_pause_age_s,
+};
 
 /// Cache-aware routing policy
 ///
@@ -234,6 +236,36 @@ impl CacheAwarePolicy {
         }
     }
 
+    fn preferred_override_enabled() -> bool {
+        env::var("SMG_ENABLE_PREFERRED_OVERRIDE")
+            .map(|v| {
+                !matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no"
+                )
+            })
+            .unwrap_or(true)
+    }
+
+    fn preferred_max_load() -> Option<usize> {
+        env::var("SMG_PREFERRED_MAX_LOAD")
+            .ok()
+            .or_else(|| env::var("SMG_PREFERRED_MAX_QUEUE_DEPTH").ok())
+            .and_then(|v| v.parse::<usize>().ok())
+    }
+
+    fn preferred_load_margin() -> Option<usize> {
+        env::var("SMG_PREFERRED_LOAD_MARGIN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+    }
+
+    fn preferred_max_pause_age_s() -> Option<f64> {
+        env::var("SMG_PREFERRED_MAX_PAUSE_AGE_S")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+    }
+
     /// Normalize model_id for mesh synchronization
     /// Converts empty model_id to UNKNOWN_MODEL_ID for consistency
     fn normalize_mesh_model_id(model_id: &str) -> &str {
@@ -361,31 +393,59 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // in the filtered worker list and is healthy; otherwise fall back to
         // cache-aware selection.
         if let Some(preferred_url) = extract_preferred_worker_url(info.headers) {
+            Metrics::record_worker_cache_aware_policy_branch("preferred_present");
             if let Some(idx) = workers
                 .iter()
                 .position(|w| w.url() == preferred_url && w.is_healthy())
             {
-                // Keep cache tree state consistent (best-effort).
-                let model_id = normalize_model_key(workers[idx].model_id());
-                if let Some(text) = info.request_text {
-                    let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
-                    if let Some(tree) = tree {
-                        tree.insert(text, workers[idx].url());
+                if !Self::preferred_override_enabled() {
+                    Metrics::record_worker_cache_aware_policy_branch("preferred_skip_disabled");
+                } else if Self::preferred_max_pause_age_s()
+                    .zip(extract_roll_pause_age_s(info.headers))
+                    .is_some_and(|(max_age, pause_age)| pause_age > max_age)
+                {
+                    Metrics::record_worker_cache_aware_policy_branch("preferred_skip_old_pause");
+                } else if Self::preferred_max_load()
+                    .is_some_and(|max_load| workers[idx].load() > max_load)
+                {
+                    Metrics::record_worker_cache_aware_policy_branch("preferred_skip_overloaded");
+                } else if Self::preferred_load_margin().is_some_and(|margin| {
+                    let min_load = workers.iter().map(|w| w.load()).min().unwrap_or(0);
+                    workers[idx].load() > min_load.saturating_add(margin)
+                }) {
+                    Metrics::record_worker_cache_aware_policy_branch("preferred_skip_overloaded");
+                } else {
+                    if extract_roll_history_len_tokens(info.headers).is_some() {
+                        Metrics::record_worker_cache_aware_policy_branch(
+                            "preferred_with_history_len",
+                        );
                     }
+
+                    // Keep cache tree state consistent (best-effort).
+                    let model_id = normalize_model_key(workers[idx].model_id());
+                    if let Some(text) = info.request_text {
+                        let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+                        if let Some(tree) = tree {
+                            tree.insert(text, workers[idx].url());
+                        }
+                    }
+
+                    workers[idx].increment_processed();
+                    Metrics::record_worker_cache_aware_policy_branch("preferred_hit");
+                    return Some(idx);
                 }
 
-                workers[idx].increment_processed();
-                Metrics::record_worker_cache_aware_policy_branch("preferred_hit");
-                return Some(idx);
-            }
-
-            // Preferred worker not found or unhealthy. Fall back to normal routing.
-            let branch = if workers.iter().any(|w| w.url() == preferred_url) {
-                "preferred_miss_unhealthy"
+                // Preferred worker exists but the soft gate rejected it. Fall back
+                // to regular cache-aware / load-aware routing below.
             } else {
-                "preferred_miss_not_found"
-            };
-            Metrics::record_worker_cache_aware_policy_branch(branch);
+                // Preferred worker not found or unhealthy. Fall back to normal routing.
+                let branch = if workers.iter().any(|w| w.url() == preferred_url) {
+                    "preferred_miss_unhealthy"
+                } else {
+                    "preferred_miss_not_found"
+                };
+                Metrics::record_worker_cache_aware_policy_branch(branch);
+            }
         } else {
             Metrics::record_worker_cache_aware_policy_branch("preferred_miss_empty");
         }
@@ -945,7 +1005,10 @@ mod tests {
         policy.init_workers(&workers);
 
         let mut headers = HeaderMap::new();
-        headers.insert("x-roll-preferred-worker-url", "http://w2:8000".parse().unwrap());
+        headers.insert(
+            "x-roll-preferred-worker-url",
+            "http://w2:8000".parse().unwrap(),
+        );
 
         let idx = policy
             .select_worker(
@@ -983,7 +1046,10 @@ mod tests {
         policy.init_workers(&workers);
 
         let mut headers = HeaderMap::new();
-        headers.insert("x-roll-preferred-worker-url", "http://w3:8000".parse().unwrap());
+        headers.insert(
+            "x-roll-preferred-worker-url",
+            "http://w3:8000".parse().unwrap(),
+        );
 
         let idx = policy
             .select_worker(
@@ -1022,7 +1088,10 @@ mod tests {
         workers[1].set_healthy(false);
 
         let mut headers = HeaderMap::new();
-        headers.insert("x-roll-preferred-worker-url", "http://w2:8000".parse().unwrap());
+        headers.insert(
+            "x-roll-preferred-worker-url",
+            "http://w2:8000".parse().unwrap(),
+        );
 
         let idx = policy
             .select_worker(
